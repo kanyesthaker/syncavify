@@ -35,7 +35,7 @@ async fn image_quantizer(image: DynamicImage, width: u32, height: u32, num_color
         .iter()
         .map(|&color| format!("{:02X}{:02X}{:02X}", color.r, color.g, color.b))
         .collect();
-    return Ok(top_color_strings)
+    Ok(top_color_strings)
 }
 
 
