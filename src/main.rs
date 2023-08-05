@@ -1,52 +1,18 @@
-use std::{fs, rc::Rc};
+use std::{fs, rc::Rc, process::Stdio, env};
 
+use dotenv::dotenv;
 use image::{DynamicImage, ImageError};
 use imagequant::{self, Attributes, RGBA, liq_error};
 use regex::Regex;
 use reqwest::Error;
-use rspotify::{
-    prelude::*,
-    scopes, AuthCodeSpotify, Credentials, OAuth, model::Image, Config,
-};
-use tokio::{fs::File, io::AsyncWriteExt, process::Command, time::sleep, time::Duration};
-
-struct ImageMeta {
-    size: u32,
-    url: String
-}
-
-async fn get_smallest_img_url(spotify: &AuthCodeSpotify) -> Option<ImageMeta> {
-    // Get the currently playing song
-    let response: Option<rspotify::model::CurrentlyPlayingContext> = spotify.current_user_playing_item().await.unwrap();
-
-
-    if let Some(context) = response {
-        // If a song is playing, grab the album/episode images and return the image with smallest size
-        let playable_item: rspotify::model::PlayableItem = context.item.unwrap();
-        let images: Vec<Image> = match playable_item {
-            rspotify::model::PlayableItem::Track(track) => {
-                track.album.images
-            }
-            rspotify::model::PlayableItem::Episode(episode) => {
-                episode.images
-            }
-        };
-        let smallest_image: (u32, String) = images
-            .iter()
-            .filter_map(|image: &Image| image.height.map(|height: u32| (height, image.url.clone())))
-            .min_by(|(height1, _url1), (height2, _url2)| height1.cmp(height2)).unwrap();
-        Some(ImageMeta { size: smallest_image.0, url: smallest_image.1 })
-    } else {
-        None
-    }
-}
+use tokio::{fs::File, io::AsyncWriteExt, process::Command};
 
 #[derive(Debug)]
 enum QuantizationError {
     LiqErr(liq_error),
 }
 
-async fn image_quantizer(image: DynamicImage, size: u32, num_colors: i32) -> Result<Vec<String>, QuantizationError> {
+async fn image_quantizer(image: DynamicImage, width: u32, height: u32, num_colors: i32) -> Result<Vec<String>, QuantizationError> {
     // Convert image to RGBA8
     let img_rgba8: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> = image.to_rgba8();
     let mut attr: Attributes = Attributes::new();
@@ -57,9 +23,10 @@ async fn image_quantizer(image: DynamicImage, size: u32, num_colors: i32) -> Res
         .into_boxed_slice();
 
     // Quantize image down to num_colors colors
-    let usize_size = usize::try_from(size).unwrap();
+    let usize_width: usize = usize::try_from(width).unwrap();
+    let usize_height: usize = usize::try_from(height).unwrap();
     attr.set_max_colors(num_colors);
-    let image = attr.new_image(&bmp, usize_size, usize_size, 0.0).map_err(QuantizationError::LiqErr)?;
+    let image = attr.new_image(&bmp, usize_width, usize_height, 0.0).map_err(QuantizationError::LiqErr)?;
     let mut quantization_result = attr.quantize(&image).map_err(QuantizationError::LiqErr)?;
     let palette = quantization_result.palette();
 
@@ -109,66 +76,60 @@ async fn update_cava_colors(config: &str, bg_color: &String, grad_1: &String, gr
 async fn reload_cava() -> std::io::Result<()> {
     // Send a signal to Cava to reload its color configuration only
     // See cava docs https://github.com/karlstav/cava
-    println!("Restarting cava");
-    let _ = Command::new("pkill")
-        .arg("-USR2")
-        .arg("cava")
+    let cmd: &str = "pkill -USR2 -x cava";
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
         .spawn()
-        .expect("Failed to reload Cava");
+        .expect("Failed to start")
+        .wait()
+        .await
+        .expect("Failed to run");
 
     Ok(())
 }
+
+async fn get_url_playerctl() -> String {
+    let cmd = "playerctl metadata mpris:artUrl 2>/dev/null | sed s/open.spotify.com/i.scdn.co/";
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .output().await;
+
+    match out {
+        Ok(result) => String::from_utf8_lossy(&result.stdout).to_string(),
+        Err(e) => panic!("Failed to get image {e:?}")
+    }
+}   
 
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
-
-    let creds: Credentials = Credentials::from_env().unwrap();
-    let oauth: OAuth = OAuth::from_env(scopes!("user-read-currently-playing")).unwrap();
-    let config: Config = Config {
-        ..Default::default()
-    };
-
-    let spotify: AuthCodeSpotify = AuthCodeSpotify::with_config(creds, oauth, config);
-
-    let auth_url: String = spotify.get_authorize_url(false).unwrap();
-    spotify.prompt_for_token(&auth_url).await.expect("Authentication Failed");
-
-    let mut image_size: u32;
+    dotenv().ok();
     let mut image_url: Rc<String> = Rc::new(String::new());
 
-    let poll_delay = Duration::from_secs(3);
     loop {
-        if let Some(image_meta) = get_smallest_img_url(&spotify).await {
-            println!("Next loop started");
-            if image_meta.url == *image_url {
-                sleep(poll_delay).await;
-                continue;
-            }
-            image_size = image_meta.size;
-            image_url = Rc::new(image_meta.url);
-        } else {
-            println!("No currently playing song");
-            sleep(poll_delay).await;
+        let next_url = get_url_playerctl().await; 
+        if next_url == *image_url {
             continue;
         }
-        println!("Smallest image url: {auth_url:?}");
+        image_url = Rc::new(next_url);
+        
         let image: DynamicImage = match download_img(image_url.to_string()).await { 
             Ok(result) => result,
             Err(e) => panic!("Image Ingestion Error! {e:?}")
         };
-        let top_colors: Vec<String> = match image_quantizer(image, image_size, 3).await {
+        let width = image.width();
+        let height: u32 = image.height();
+        let top_colors: Vec<String> = match image_quantizer(image, width, height, 3).await {
             Ok(result) => result,
             Err(e) => panic!("Image Quantization Error! {e:?}")
         };
-        println!("Top colors: {top_colors:?}");
-        match update_cava_colors("/home/kanyes/.config/cava/config", &top_colors[0], &top_colors[1], &top_colors[2]).await {
-            Ok(result) => {},
-            Err(e) => {}
-        };
-        reload_cava().await;
-        sleep(poll_delay).await;
-        println!("About to start next iteration!");
+
+        let config_path = env::var("CAVA_CONFIG_LOCATION").expect("No config found").to_string();
+        let _ = update_cava_colors(&config_path, &top_colors[0], &top_colors[1], &top_colors[2]).await;
+        let _ = reload_cava().await;
     }
 }
