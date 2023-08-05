@@ -1,4 +1,4 @@
-use std::{fs, rc::Rc, process::Stdio, env};
+use std::{fs, rc::Rc, process::Stdio, env, cmp::Ordering};
 
 use dotenv::dotenv;
 use image::{DynamicImage, ImageError};
@@ -11,6 +11,12 @@ use tokio::{fs::File, io::AsyncWriteExt, process::Command};
 enum QuantizationError {
     LiqErr(liq_error),
 }
+
+fn brightness(color: RGBA) -> f64 {
+    // https://alienryderflex.com/hsp.html
+    (f64::powf(color.r as f64, 2.0) * 0.299) + (f64::powf(color.g as f64, 2.0) * 0.587) + (f64::powf(color.b as f64, 2.0) * 0.114).sqrt()
+}
+
 
 async fn image_quantizer(image: DynamicImage, width: u32, height: u32, num_colors: i32) -> Result<Vec<String>, QuantizationError> {
     // Convert image to RGBA8
@@ -28,13 +34,19 @@ async fn image_quantizer(image: DynamicImage, width: u32, height: u32, num_color
     attr.set_max_colors(num_colors);
     let image = attr.new_image(&bmp, usize_width, usize_height, 0.0).map_err(QuantizationError::LiqErr)?;
     let mut quantization_result = attr.quantize(&image).map_err(QuantizationError::LiqErr)?;
-    let palette = quantization_result.palette();
+    let mut palette = quantization_result.palette();
 
+    palette.sort_by(|a, b| {
+        let luma_a = brightness(*a);
+        let luma_b = brightness(*b);
+        luma_a.partial_cmp(&luma_b).unwrap_or(Ordering::Equal)
+    });
     // Convert RGBA into hex and return in a Vec
     let top_color_strings: Vec<String> = palette
         .iter()
         .map(|&color| format!("{:02X}{:02X}{:02X}", color.r, color.g, color.b))
         .collect();
+
     Ok(top_color_strings)
 }
 
