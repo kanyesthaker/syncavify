@@ -5,7 +5,37 @@ use image::{DynamicImage, ImageError};
 use imagequant::{self, Attributes, RGBA, liq_error};
 use regex::Regex;
 use reqwest::Error;
-use tokio::{fs::File, io::AsyncWriteExt, process::Command};
+use tokio::{fs::File, io::AsyncWriteExt, process::Command, time::sleep, time::Duration};
+use rspotify::{
+    prelude::*,
+    scopes, AuthCodeSpotify, Credentials, OAuth, model::Image, Config,
+};
+
+async fn get_smallest_img_url(spotify: &AuthCodeSpotify) -> Option<String> {
+    // Get the currently playing song
+    let response: Option<rspotify::model::CurrentlyPlayingContext> = spotify.current_user_playing_item().await.unwrap();
+
+
+    if let Some(context) = response {
+        // If a song is playing, grab the album/episode images and return the image with smallest size
+        let playable_item: rspotify::model::PlayableItem = context.item.unwrap();
+        let images: Vec<Image> = match playable_item {
+            rspotify::model::PlayableItem::Track(track) => {
+                track.album.images
+            }
+            rspotify::model::PlayableItem::Episode(episode) => {
+                episode.images
+            }
+        };
+        let smallest_image: String = images
+            .iter()
+            .filter_map(|image: &Image| image.height.map(|height: u32| (height, image.url.clone())))
+            .min_by(|(height1, _url1), (height2, _url2)| height1.cmp(height2)).unwrap().1;
+        Some(smallest_image)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug)]
 enum QuantizationError {
@@ -113,35 +143,63 @@ async fn get_url_playerctl() -> String {
         Ok(result) => String::from_utf8_lossy(&result.stdout).to_string(),
         Err(e) => panic!("Failed to get image {e:?}")
     }
-}   
+}
 
+async fn auth_spotify() -> AuthCodeSpotify {
+    let creds: Credentials = Credentials::from_env().unwrap();
+    let oauth: OAuth = OAuth::from_env(scopes!("user-read-currently-playing")).unwrap();
+    let config: Config = Config {
+        ..Default::default()
+    };
+
+    let spotify: AuthCodeSpotify = AuthCodeSpotify::with_config(creds, oauth, config);
+
+    let auth_url: String = spotify.get_authorize_url(false).unwrap();
+    spotify.prompt_for_token(&auth_url).await.expect("Authentication Failed");
+    spotify
+}
+
+async fn image_pipeline(url: String) {
+    let image: DynamicImage = match download_img(url).await { 
+        Ok(result) => result,
+        Err(e) => panic!("Image Ingestion Error! {e:?}")
+    };
+    let width = image.width();
+    let height: u32 = image.height();
+    let top_colors: Vec<String> = match image_quantizer(image, width, height, 3).await {
+        Ok(result) => result,
+        Err(e) => panic!("Image Quantization Error! {e:?}")
+    };
+
+    let config_path = env::var("CAVA_CONFIG_LOCATION").expect("No config found").to_string();
+    let _ = update_cava_colors(&config_path, &top_colors[0], &top_colors[1], &top_colors[2]).await;
+    let _ = reload_cava().await;
+}
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
     dotenv().ok();
     let mut image_url: Rc<String> = Rc::new(String::new());
-
-    loop {
-        let next_url = get_url_playerctl().await; 
-        if next_url == *image_url {
-            continue;
+    if env::consts::OS == "linux" {
+        loop {
+            let next_url = get_url_playerctl().await; 
+            if next_url != *image_url {
+                image_url = Rc::new(next_url);
+                let _ = image_pipeline(image_url.to_string()).await;
+            }
         }
-        image_url = Rc::new(next_url);
-        
-        let image: DynamicImage = match download_img(image_url.to_string()).await { 
-            Ok(result) => result,
-            Err(e) => panic!("Image Ingestion Error! {e:?}")
-        };
-        let width = image.width();
-        let height: u32 = image.height();
-        let top_colors: Vec<String> = match image_quantizer(image, width, height, 3).await {
-            Ok(result) => result,
-            Err(e) => panic!("Image Quantization Error! {e:?}")
-        };
-
-        let config_path = env::var("CAVA_CONFIG_LOCATION").expect("No config found").to_string();
-        let _ = update_cava_colors(&config_path, &top_colors[0], &top_colors[1], &top_colors[2]).await;
-        let _ = reload_cava().await;
+    } else {
+        let spotify = auth_spotify().await;
+        let poll_delay = Duration::from_secs(1);
+        loop {
+            if let Some(next_url) = get_smallest_img_url(&spotify).await {
+                if next_url != *image_url {
+                    image_url = Rc::new(next_url);
+                    let _ = image_pipeline(image_url.to_string()).await;
+                }
+            }
+            let _ = sleep(poll_delay).await;
+        }
     }
 }
