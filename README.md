@@ -20,3 +20,6 @@ we can just auth with the Spotify client directly (even if it is a bit cumbersom
 1. Grab a set of Spotify API credentials (either get them from me (Kanyes) or [use your own](https://developer.spotify.com/dashboard/create)).
 2. Put these API keys into your `.env` files under the appropriate environment variables
 3. When you run the program, you will be taken to your browser and asked to authenticate with Spotify. Once you do so, copy and paste the URL you are taken to (will be an error page) and paste it back into your terminal. As of right now there's no refresh-token persistence, so you'll have to do this copy-pasting every time you restart the app.
+
+https://github.com/kanyesthaker/syncavify/assets/31911175/09361518-09eb-43c3-ab3b-1eaeef9fc1c2
+
