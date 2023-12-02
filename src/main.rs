@@ -1,15 +1,18 @@
-use std::{fs, rc::Rc, process::Stdio, env, cmp::Ordering};
+use anyhow::Result;
+use std::{fs, process::Stdio, env::{self, consts::OS}, cmp::Ordering};
 
 use dotenv::dotenv;
-use image::{DynamicImage, ImageError};
-use imagequant::{self, Attributes, RGBA, liq_error};
+use image::DynamicImage;
+use imagequant::{self, RGBA};
+use itertools::Itertools;
 use regex::Regex;
-use reqwest::Error;
-use tokio::{fs::File, io::AsyncWriteExt, process::Command, time::sleep, time::Duration};
+use tokio::{fs::File, io::AsyncWriteExt, process::Command};
 use rspotify::{
     prelude::*,
     scopes, AuthCodeSpotify, Credentials, OAuth, model::Image, Config,
 };
+
+const DEFAULT_IMAGE_URL: &str = "https://placehold.co/600x400";
 
 async fn get_smallest_img_url(spotify: &AuthCodeSpotify) -> Option<String> {
     // Get the currently playing song
@@ -37,66 +40,9 @@ async fn get_smallest_img_url(spotify: &AuthCodeSpotify) -> Option<String> {
     }
 }
 
-#[derive(Debug)]
-enum QuantizationError {
-    LiqErr(liq_error),
-}
+struct CavaColors<'a>(&'a String, &'a String, &'a String);
 
-fn brightness(color: RGBA) -> f64 {
-    // https://alienryderflex.com/hsp.html
-    (f64::powf(color.r as f64, 2.0) * 0.299) + (f64::powf(color.g as f64, 2.0) * 0.587) + (f64::powf(color.b as f64, 2.0) * 0.114).sqrt()
-}
-
-
-async fn image_quantizer(image: DynamicImage, width: u32, height: u32, num_colors: i32) -> Result<Vec<String>, QuantizationError> {
-    // Convert image to RGBA8
-    let img_rgba8: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> = image.to_rgba8();
-    let mut attr: Attributes = Attributes::new();
-    let bmp = img_rgba8
-        .pixels()
-        .map(|p| RGBA::new(p.0[0], p.0[1], p.0[2], p.0[3]))
-        .collect::<Vec<RGBA<>>>()
-        .into_boxed_slice();
-
-    // Quantize image down to num_colors colors
-    let usize_width: usize = usize::try_from(width).unwrap();
-    let usize_height: usize = usize::try_from(height).unwrap();
-    attr.set_max_colors(num_colors);
-    let image = attr.new_image(&bmp, usize_width, usize_height, 0.0).map_err(QuantizationError::LiqErr)?;
-    let mut quantization_result = attr.quantize(&image).map_err(QuantizationError::LiqErr)?;
-    let mut palette = quantization_result.palette();
-
-    palette.sort_by(|a, b| {
-        let luma_a = brightness(*a);
-        let luma_b = brightness(*b);
-        luma_a.partial_cmp(&luma_b).unwrap_or(Ordering::Equal)
-    });
-    // Convert RGBA into hex and return in a Vec
-    let top_color_strings: Vec<String> = palette
-        .iter()
-        .map(|&color| format!("{:02X}{:02X}{:02X}", color.r, color.g, color.b))
-        .collect();
-
-    Ok(top_color_strings)
-}
-
-
-#[derive(Debug)]
-enum ImageIngestError {
-    DownloadErr(Error),
-    ImageErr(ImageError),
-}
-
-async fn download_img(url: String) -> Result<DynamicImage, ImageIngestError> {
-    // Download the image into bytes and return an image::DynamicImage
-    let response: reqwest::Response = reqwest::get(url).await.map_err(ImageIngestError::DownloadErr)?;
-    let buf = response.bytes().await.map_err(ImageIngestError::DownloadErr)?;
-
-    let image: DynamicImage = image::load_from_memory(&buf).map_err(ImageIngestError::ImageErr)?;
-    Ok(image)
-}
-
-async fn update_cava_colors(config: &str, bg_color: &String, grad_1: &String, grad_2: &String) -> Result<(), std::io::Error> {
+async fn update_cava_colors(config: &str, CavaColors(ref bg_color, ref grad_1, ref grad_2): CavaColors<'_>) -> Result<()> {
     // HACK uses regex replacement to swap out the colors in the config, note this is not very customizable at the moment
     let config_str = fs::read_to_string(config)?;
 
@@ -131,20 +77,6 @@ async fn reload_cava() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn get_url_playerctl() -> String {
-    let cmd = "playerctl metadata mpris:artUrl 2>/dev/null | sed s/open.spotify.com/i.scdn.co/";
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .stdout(Stdio::piped())
-        .output().await;
-
-    match out {
-        Ok(result) => String::from_utf8_lossy(&result.stdout).to_string(),
-        Err(e) => panic!("Failed to get image {e:?}")
-    }
-}
-
 async fn auth_spotify() -> AuthCodeSpotify {
     let creds: Credentials = Credentials::from_env().unwrap();
     let oauth: OAuth = OAuth::from_env(scopes!("user-read-currently-playing")).unwrap();
@@ -159,47 +91,110 @@ async fn auth_spotify() -> AuthCodeSpotify {
     spotify
 }
 
-async fn image_pipeline(url: String) {
-    let image: DynamicImage = match download_img(url).await { 
-        Ok(result) => result,
-        Err(e) => panic!("Image Ingestion Error! {e:?}")
-    };
-    let width = image.width();
-    let height: u32 = image.height();
-    let top_colors: Vec<String> = match image_quantizer(image, width, height, 3).await {
-        Ok(result) => result,
-        Err(e) => panic!("Image Quantization Error! {e:?}")
-    };
+struct CavaImage {
+    url: String,
+    num_quantization_colors: i32,
+}
 
-    let config_path = env::var("CAVA_CONFIG_LOCATION").expect("No config found").to_string();
-    let _ = update_cava_colors(&config_path, &top_colors[0], &top_colors[1], &top_colors[2]).await;
-    let _ = reload_cava().await;
+impl CavaImage {
+    fn new(num_colors: i32) -> Self {
+        Self {
+            url: DEFAULT_IMAGE_URL.to_owned(),
+            num_quantization_colors: num_colors,
+        }
+    }
+
+    async fn do_dbus_loop(&mut self) {
+        loop {
+            let next_url = get_url_playerctl().await;
+            if *next_url != *self.url {
+                self.url = next_url;
+                self.image_pipeline().await;
+            }
+        }
+    }
+
+    async fn image_pipeline(&self) {
+        let image = download_img(&self.url)
+            .await
+            .expect("Image ingestion error");
+
+        let colors = image_quantizer(image, self.num_quantization_colors).await.unwrap();
+        let config_path = env::var("CAVA_CONFIG_LOCATION").unwrap_or(String::from(".config/cava/config"));
+        let _ = update_cava_colors(&config_path, CavaColors(&colors[0], &colors[1], &colors[2])).await;
+        let _ = reload_cava().await;
+    }
+}
+
+async fn get_url_playerctl() -> String {
+    let cmd = "playerctl metadata mpris:artUrl 2>/dev/null | sed s/open.spotify.com/i.scdn.co/";
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdout(Stdio::piped())
+        .output().await;
+
+    String::from_utf8_lossy(&out.ok().unwrap().stdout).to_string()
+}
+
+async fn download_img(url: &String) -> Result<DynamicImage> {
+    let image_buffer = reqwest::get(url)
+        .await?
+        .bytes()
+        .await?;
+    Ok(image::load_from_memory(&image_buffer)?)
+}
+
+fn brightness(color: RGBA) -> f64 {
+    // https://alienryderflex.com/hsp.html
+    (f64::powf(color.r as f64, 2.0) * 0.299)
+    + (f64::powf(color.g as f64, 2.0) * 0.587)
+    + (f64::powf(color.b as f64, 2.0) * 0.114).sqrt()
+}
+
+async fn image_quantizer(image: DynamicImage, num_colors: i32) -> Result<Vec<String>> {
+    let mut attr = imagequant::Attributes::new();
+    attr.set_max_colors(num_colors);
+    let bmp = image
+        .to_rgba8()
+        .pixels()
+        .map(|p| imagequant::RGBA::new(p.0[0], p.0[1], p.0[2], p.0[3]))
+        .collect::<Vec<RGBA>>();
+    let image = attr.new_image(
+        &bmp,
+        image.width() as usize,
+        image.height() as usize,
+        0.0)?;
+    let palette = attr
+        .quantize(&image)?
+        .palette()
+        .into_iter()
+        .sorted_by(|a, b| {
+            brightness(*a).partial_cmp(&brightness(*b)).unwrap_or(Ordering::Equal)
+        })
+        .map(|color| format!("{:02X}{:02X}{:02X}", color.r, color.g, color.b))
+        .collect();
+
+    Ok(palette)
 }
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    // env_logger::init();
     dotenv().ok();
-    let mut image_url: Rc<String> = Rc::new(String::new());
-    if env::consts::OS == "linux" {
-        loop {
-            let next_url = get_url_playerctl().await; 
-            if next_url != *image_url {
-                image_url = Rc::new(next_url);
-                let _ = image_pipeline(image_url.to_string()).await;
-            }
-        }
-    } else {
-        let spotify = auth_spotify().await;
-        let poll_delay = Duration::from_secs(1);
-        loop {
-            if let Some(next_url) = get_smallest_img_url(&spotify).await {
-                if next_url != *image_url {
-                    image_url = Rc::new(next_url);
-                    let _ = image_pipeline(image_url.to_string()).await;
-                }
-            }
-            let _ = sleep(poll_delay).await;
-        }
-    }
+    let mut cava = CavaImage::new(3);
+    if OS == "linux" { cava.do_dbus_loop().await } else { println!("Whoops!") }
+    
+    //     let spotify = auth_spotify().await;
+    //     let poll_delay = Duration::from_secs(1);
+    //     loop {
+    //         if let Some(next_url) = get_smallest_img_url(&spotify).await {
+    //             if next_url != *image_url {
+    //                 image_url = Rc::new(next_url);
+    //                 let _ = image_pipeline(image_url.to_string()).await;
+    //             }
+    //         }
+    //         let _ = sleep(poll_delay).await;
+    //     }
+    // }
 }
